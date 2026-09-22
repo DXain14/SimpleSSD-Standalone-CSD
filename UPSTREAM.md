@@ -9,7 +9,11 @@ This source tree is based on:
 - Local changes: the CSD and standalone changes recorded in
   [`CSD_MODIFICATIONS.md`](CSD_MODIFICATIONS.md)
 
-The publication plan is a GitHub fork under the original project engineer's
-personal account. The final GitHub owner, repository name, remote URL, and
-embedded SimpleSSD submodule URL are recorded when the forks are created.
-This repository must not be presented as an official upstream release.
+Published fork:
+
+- Repository: `https://github.com/DXain14/SimpleSSD-Standalone-CSD`
+- Embedded CSD SimpleSSD: `https://github.com/DXain14/SimpleSSD-CSD`
+- Embedded CSD commit: `1c886626d5abecdc87d69ba7388db4a26869e6b8`
+
+This repository is an unofficial fork and must not be presented as an
+official upstream release.

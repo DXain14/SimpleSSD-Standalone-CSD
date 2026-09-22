@@ -1,6 +1,6 @@
 # CMake Temporary Files
 /build/
-/build-asan/
+/build-*/
 CMakeFiles/
 *.cmake
 !test/*.cmake

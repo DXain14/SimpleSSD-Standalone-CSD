@@ -5,19 +5,20 @@ This repository is an unofficial research extension of
 It provides a standalone workload and test entry point for the CSD
 `read_compute` extension.
 
-The embedded `simplessd` directory is a Git submodule and must resolve to a
-public SimpleSSD source revision that contains the matching CSD implementation
-before this repository is published. The publication plan is a GitHub fork
-under the original project engineer's personal account; the final submodule
-URL is recorded when the fork is created.
+The embedded `simplessd` directory is a Git submodule pinned to the public
+CSD-modified SimpleSSD repository at commit
+`1c886626d5abecdc87d69ba7388db4a26869e6b8`. This repository is an unofficial
+GitHub fork published at
+`https://github.com/DXain14/SimpleSSD-Standalone-CSD`.
 
 ## Quick start
 
 Clone the repository with submodules, then build from its root:
 
 ```bash
-git clone --recurse-submodules <standalone-repository>
-cd simplessd-standalone
+git clone --branch 2.0 --recurse-submodules \
+  https://github.com/DXain14/SimpleSSD-Standalone-CSD.git
+cd SimpleSSD-Standalone-CSD
 cmake -S . -B build
 cmake --build build -j
 ctest --test-dir build -L csd -E stress --output-on-failure

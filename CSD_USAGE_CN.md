@@ -15,14 +15,17 @@
 全新 clone 后必须递归初始化子模块：
 
 ```bash
-git clone --recurse-submodules <standalone-repository>
-cd simplessd-standalone
+git clone --branch 2.0 --recurse-submodules \
+  https://github.com/DXain14/SimpleSSD-Standalone-CSD.git
+cd SimpleSSD-Standalone-CSD
 ```
 
-当前工作树中，外部 SimpleSSD 和本子模块内容已经逐文件一致。正式公开
-发布前，子模块 Gitlink 必须更新到公开可访问的 CSD SimpleSSD commit。
-发布方案已确定采用 GitHub fork。正式发布前，子模块 Gitlink 仍必须更新
-到个人账号下公开可访问、包含匹配 CSD 实现的 SimpleSSD fork commit。
+standalone 的子模块已经指向公开可访问的 CSD SimpleSSD fork：
+
+```text
+https://github.com/DXain14/SimpleSSD-CSD.git
+commit 1c886626d5abecdc87d69ba7388db4a26869e6b8
+```
 
 ## 2. 当前功能范围
 

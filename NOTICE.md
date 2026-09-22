@@ -13,18 +13,17 @@ This repository is based on the public SimpleSSD Standalone codebase:
 ## Embedded SimpleSSD
 
 The `simplessd/` directory is a Git submodule. Its current local source tree
-is content-identical to the CSD-modified SimpleSSD tree, but its Gitlink must
-be updated to a public CSD commit before release.
+is pinned to the public CSD-modified SimpleSSD fork:
 
-- Current local submodule base: `73ad8ad5220ce5ebfeb055687d0328765a046c0f`
+- Repository: `https://github.com/DXain14/SimpleSSD-CSD.git`
+- CSD commit: `1c886626d5abecdc87d69ba7388db4a26869e6b8`
+- Upstream base: `73ad8ad5220ce5ebfeb055687d0328765a046c0f`
 - License: GNU GPLv3
 
 ## CSD extension
 
 The CSD extension and standalone workload changes are listed in
-[`CSD_MODIFICATIONS.md`](CSD_MODIFICATIONS.md). The release owner must record
-the legally authorized CSD copyright holder or contributors before public
-distribution.
+[`CSD_MODIFICATIONS.md`](CSD_MODIFICATIONS.md).
 
 Copyright (C) 2026 DXain14
 
