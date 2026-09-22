@@ -28,3 +28,13 @@ If applicable, add screenshots to help explain your problem.
  - Compiler version used to build SimpleSSD-Standalone: [e.g. GCC 5.3.1]
  - SimpleSSD-Standalone version: [e.g. v2.0-rc4 - or commit hash]
  - SimpleSSD version: [e.g. v2.0.6 - or commit hash]
+
+### CSD context
+ - CSD enabled: [yes/no]
+ - Workload mode: [generator/trace/direct NVMe/not applicable]
+ - CSD opcode and matrix shape: [e.g. 0xC0 and 4x4]
+ - Reproduction command and configuration files:
+
+```text
+paste the command and relevant configuration here
+```

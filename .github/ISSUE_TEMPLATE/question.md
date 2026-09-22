@@ -14,6 +14,9 @@ assignees: ''
  - SimpleSSD version: [e.g. v2.0.6 - or commit hash]
 
 ### Execution information
+- CSD enabled: [yes/no]
+- Workload mode: [generator/trace/direct NVMe/not applicable]
+- CSD opcode and matrix shape: [e.g. 0xC0 and 4x4]
 - Standalone configuration file:
 [e.g. TimingMode = 1 ...]
 

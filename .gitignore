@@ -1,12 +1,21 @@
 # CMake Temporary Files
+/build/
+/build-asan/
 CMakeFiles/
 *.cmake
+!test/*.cmake
 CMakeCache.txt
 
 # SimpleSSD output
 libsimplessd.a
 libmcpat.a
 simplessd-standalone
+simplessd-csd-smoke
+simplessd-csd-unit
+simplessd-csd-integration
+simplessd-csd-stress
+simplessd-csd-disabled
+simplessd-csd-write-timing
 
 # Visual Studio Specific
 .vs/
@@ -36,3 +45,14 @@ compile_flags.txt
 # VSCode Specific
 .vscode/
 *.code-workspace
+
+# Release artifacts and local research material
+*.tar.gz
+*.whl
+*.pdf
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
