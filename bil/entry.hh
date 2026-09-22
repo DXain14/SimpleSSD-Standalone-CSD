@@ -26,6 +26,8 @@
 #include <fstream>
 #include <functional>
 #include <list>
+#include <memory>
+#include <vector>
 
 #include "sim/cfg_reader.hh"
 #include "sim/engine.hh"
@@ -40,8 +42,33 @@ enum BIO_TYPE : uint8_t {
   BIO_WRITE,
   BIO_FLUSH,
   BIO_TRIM,
+  BIO_READ_COMPUTE,
   BIO_NUM,
 };
+
+typedef struct _CSDGEMVRequest {
+  uint64_t matrixSLBA;
+  uint32_t rows;
+  uint32_t cols;
+  uint32_t lda;
+  std::vector<uint16_t> vectorFP16;
+  std::vector<float> outputFP32;
+  std::vector<float> expectedFP32;
+  uint8_t opcode;
+  bool useSGL;
+  bool verifyOutput;
+  uint64_t controlBytes;
+
+  _CSDGEMVRequest()
+      : matrixSLBA(0),
+        rows(0),
+        cols(0),
+        lda(0),
+        opcode(0xC0),
+        useSGL(false),
+        verifyOutput(false),
+        controlBytes(0) {}
+} CSDGEMVRequest;
 
 typedef struct _BIO {
   uint64_t id;
@@ -50,9 +77,11 @@ typedef struct _BIO {
   BIO_TYPE type;
   uint64_t offset;
   uint64_t length;
+  std::shared_ptr<std::vector<uint8_t>> payload;
+  std::shared_ptr<CSDGEMVRequest> csd;
 
   // I/O completion
-  std::function<void(uint64_t)> callback;
+  std::function<void(uint64_t, uint16_t)> callback;
 
   // Statistics
   uint64_t submittedAt;
@@ -84,13 +113,14 @@ class BlockIOEntry {
 
   // Statistics
   uint64_t io_count;
+  uint64_t error_count;
   uint64_t minLatency;
   uint64_t maxLatency;
   uint64_t sumLatency;
   uint64_t squareSumLatency;
 
-  std::function<void(uint64_t)> callback;
-  void completion(uint64_t);
+  std::function<void(uint64_t, uint16_t)> callback;
+  void completion(uint64_t, uint16_t);
 
  public:
   BlockIOEntry(ConfigReader &, Engine &, DriverInterface *, std::ostream *);

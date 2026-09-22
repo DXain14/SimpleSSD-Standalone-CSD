@@ -19,6 +19,11 @@
 
 #include "igl/trace/trace_replayer.hh"
 
+#include <cerrno>
+#include <cstdlib>
+#include <memory>
+
+#include "igl/csd_workload.hh"
 #include "simplessd/sim/trace.hh"
 #include "simplessd/util/algorithm.hh"
 
@@ -35,6 +40,9 @@ TraceReplayer::TraceReplayer(Engine &e, BIL::BlockIOEntry &b,
       io_count(0),
       read_count(0),
       write_count(0),
+      compute_count(0),
+      verified_compute_count(0),
+      failed_compute_count(0),
       io_depth(0) {
   // Check file
   auto filename = c.readString(CONFIG_TRACE, TRACE_FILE);
@@ -81,7 +89,18 @@ TraceReplayer::TraceReplayer(Engine &e, BIL::BlockIOEntry &b,
       (uint32_t)c.readUint(CONFIG_TRACE, TRACE_GROUP_NANO_SEC);
   groupID[ID_TIME_PS] =
       (uint32_t)c.readUint(CONFIG_TRACE, TRACE_GROUP_PICO_SEC);
+  groupID[ID_MATRIX_SLBA] =
+      (uint32_t)c.readUint(CONFIG_TRACE, TRACE_GROUP_MATRIX_SLBA);
+  groupID[ID_ROWS] = (uint32_t)c.readUint(CONFIG_TRACE, TRACE_GROUP_ROWS);
+  groupID[ID_COLS] = (uint32_t)c.readUint(CONFIG_TRACE, TRACE_GROUP_COLS);
+  groupID[ID_VECTOR_SEED] =
+      (uint32_t)c.readUint(CONFIG_TRACE, TRACE_GROUP_VECTOR_SEED);
+  groupID[ID_MATRIX_SEED] =
+      (uint32_t)c.readUint(CONFIG_TRACE, TRACE_GROUP_MATRIX_SEED);
   useHex = c.readBoolean(CONFIG_TRACE, TRACE_USE_HEX);
+  csdOpcode = (uint8_t)c.readUint(CONFIG_TRACE, TRACE_CSD_OPCODE);
+  csdUseSGL = c.readBoolean(CONFIG_TRACE, TRACE_CSD_USE_SGL);
+  csdVerifyOutput = c.readBoolean(CONFIG_TRACE, TRACE_CSD_VERIFY_OUTPUT);
 
   if (groupID[ID_OPERATION] == 0) {
     SimpleSSD::panic("Operation group ID cannot be 0");
@@ -94,7 +113,22 @@ TraceReplayer::TraceReplayer(Engine &e, BIL::BlockIOEntry &b,
     useLBALength = true;
   }
 
-  if (useLBALength || useLBAOffset) {
+  bool hasCSDBaseGroups = groupID[ID_MATRIX_SLBA] > 0 &&
+                          groupID[ID_ROWS] > 0 && groupID[ID_COLS] > 0;
+  bool hasCSDComputeGroups = hasCSDBaseGroups && groupID[ID_VECTOR_SEED] > 0;
+  bool hasCSDMatrixGroups = hasCSDBaseGroups && groupID[ID_MATRIX_SEED] > 0;
+  bool hasAnyCSDGroup = groupID[ID_MATRIX_SLBA] > 0 ||
+                        groupID[ID_ROWS] > 0 || groupID[ID_COLS] > 0 ||
+                        groupID[ID_VECTOR_SEED] > 0 ||
+                        groupID[ID_MATRIX_SEED] > 0;
+  bool hasCSDGroups = hasCSDComputeGroups || hasCSDMatrixGroups;
+
+  if ((hasAnyCSDGroup || csdVerifyOutput) &&
+      c.readUint(CONFIG_GLOBAL, GLOBAL_INTERFACE) != INTERFACE_NVME) {
+    SimpleSSD::panic("CSD trace read_compute requires Interface = 1 (NVMe)");
+  }
+
+  if (useLBALength || useLBAOffset || hasCSDGroups) {
     lbaSize = (uint32_t)c.readUint(CONFIG_TRACE, TRACE_LBA_SIZE);
 
     if (SimpleSSD::popcount(lbaSize) != 1) {
@@ -102,11 +136,19 @@ TraceReplayer::TraceReplayer(Engine &e, BIL::BlockIOEntry &b,
     }
   }
 
-  if (!useLBAOffset && groupID[ID_BYTE_OFFSET] == 0) {
-    SimpleSSD::panic("Both LBA Offset and Byte Offset group ID cannot be 0");
+  bool hasAddressGroups =
+      (useLBAOffset || groupID[ID_BYTE_OFFSET] > 0) &&
+      (useLBALength || groupID[ID_BYTE_LENGTH] > 0);
+
+  if (!hasAddressGroups && !hasCSDGroups) {
+    SimpleSSD::panic(
+        "Trace requires block address groups or CSD matrix groups");
   }
-  if (!useLBALength && groupID[ID_BYTE_LENGTH] == 0) {
-    SimpleSSD::panic("Both LBA Length and Byte Length group ID cannot be 0");
+  if (hasAnyCSDGroup && !hasCSDGroups) {
+    SimpleSSD::panic("Incomplete CSD trace group configuration");
+  }
+  if (csdVerifyOutput && !hasCSDMatrixGroups) {
+    SimpleSSD::panic("CSD trace output verification requires MatrixSeed group");
   }
 
   timeValids[0] = groupID[ID_TIME_SEC] > 0 ? true : false;
@@ -124,7 +166,9 @@ TraceReplayer::TraceReplayer(Engine &e, BIL::BlockIOEntry &b,
 
   firstTick = std::numeric_limits<uint64_t>::max();
 
-  completionEvent = [this](uint64_t id) { iocallback(id); };
+  completionEvent = [this](uint64_t id, uint16_t status) {
+    iocallback(id, status);
+  };
 
   submitEvent = engine.allocateEvent([this](uint64_t) { submitIO(); });
 }
@@ -175,7 +219,10 @@ void TraceReplayer::printStats(std::ostream &out) {
       << std::to_string((double)io_submitted / tick * 1000000000000.) << " B/s)"
       << std::endl;
   out << "I/O (counts): " << io_count << " (Read: " << read_count
-      << ", Write: " << write_count << ")" << std::endl;
+      << ", Write: " << write_count << ", ReadCompute: " << compute_count
+      << ")" << std::endl;
+  out << "VerifiedReadCompute: " << verified_compute_count << std::endl;
+  out << "FailedReadCompute: " << failed_compute_count << std::endl;
   out << "*** End of statistics ***" << std::endl;
 
   bioEntry.printStats(out);
@@ -251,6 +298,25 @@ uint64_t TraceReplayer::mergeTime(std::smatch &match) {
   return tick;
 }
 
+uint64_t TraceReplayer::parseInteger(std::smatch &match, uint32_t group,
+                                     const char *name) {
+  if (group == 0 || match.size() <= group) {
+    SimpleSSD::panic("Trace field %s parse failed", name);
+  }
+
+  std::string text = match[group].str();
+  char *end = nullptr;
+
+  errno = 0;
+  uint64_t ret = strtoull(text.c_str(), &end, useHex ? 16 : 10);
+
+  if (errno == ERANGE || end == text.c_str() || *end != '\0') {
+    SimpleSSD::panic("Trace field %s parse failed", name);
+  }
+
+  return ret;
+}
+
 BIL::BIO_TYPE TraceReplayer::getType(std::string type) {
   io_count++;
 
@@ -262,6 +328,8 @@ BIL::BIO_TYPE TraceReplayer::getType(std::string type) {
       return BIL::BIO_READ;
     case 'w':
     case 'W':
+    case 'm':
+    case 'M':
       write_count++;
 
       return BIL::BIO_WRITE;
@@ -273,6 +341,11 @@ BIL::BIO_TYPE TraceReplayer::getType(std::string type) {
     case 'd':
     case 'D':
       return BIL::BIO_TRIM;
+    case 'c':
+    case 'C':
+      compute_count++;
+
+      return BIL::BIO_READ_COMPUTE;
   }
 
   return BIL::BIO_NUM;
@@ -310,30 +383,73 @@ void TraceReplayer::parseLine() {
 
   // Get time
   linedata.tick = mergeTime(match);
+  std::string operation = match[groupID[ID_OPERATION]].str();
+  linedata.type = getType(operation);
+  linedata.csdMatrixPreload = operation[0] == 'm' || operation[0] == 'M';
 
-  // Fill BIO
-  if (useLBAOffset) {
-    linedata.offset = strtoul(match[groupID[ID_LBA_OFFSET]].str().c_str(),
-                              nullptr, useHex ? 16 : 10) *
-                      lbaSize;
+  if (linedata.type == BIL::BIO_READ_COMPUTE ||
+      linedata.csdMatrixPreload) {
+    uint64_t offset;
+    uint64_t rows = parseInteger(match, groupID[ID_ROWS], "Rows");
+    uint64_t cols = parseInteger(match, groupID[ID_COLS], "Cols");
+    CSDWorkload::Shape shape =
+        CSDWorkload::validateShape(rows, cols, "Trace replayer");
+
+    linedata.matrixSLBA =
+        parseInteger(match, groupID[ID_MATRIX_SLBA], "MatrixSLBA");
+    linedata.rows = shape.rows;
+    linedata.cols = shape.cols;
+    linedata.matrixBytes = shape.matrixBytes;
+    linedata.matrixTransferBytes = CSDWorkload::transferBytes(
+        shape.matrixBytes, (uint64_t)lbaSize, "Trace replayer");
+    linedata.matrixTransferLBAs = CSDWorkload::transferLBAs(
+        shape.matrixBytes, (uint64_t)lbaSize, "Trace replayer");
+    CSDWorkload::validatePlacement(linedata.matrixSLBA,
+                                   linedata.matrixTransferLBAs, 1,
+                                   ssdSize / lbaSize, "Trace replayer");
+    CSDWorkload::validateControlBytes(linedata.rows, linedata.cols, 0,
+                                      "Trace replayer");
+
+    if (!CSDWorkload::checkedMul(linedata.matrixSLBA, (uint64_t)lbaSize,
+                                 offset)) {
+      SimpleSSD::panic("Trace replayer: CSD matrix offset overflow");
+    }
+
+    linedata.offset = offset;
+    linedata.length = linedata.csdMatrixPreload ? linedata.matrixTransferBytes
+                                                : linedata.matrixBytes;
+
+    if (linedata.csdMatrixPreload) {
+      linedata.matrixSeed =
+          parseInteger(match, groupID[ID_MATRIX_SEED], "MatrixSeed");
+    }
+    else {
+      linedata.vectorSeed =
+          parseInteger(match, groupID[ID_VECTOR_SEED], "VectorSeed");
+    }
   }
   else {
-    linedata.offset = strtoul(match[groupID[ID_BYTE_OFFSET]].str().c_str(),
-                              nullptr, useHex ? 16 : 10);
-  }
+    // Fill BIO
+    if (useLBAOffset) {
+      linedata.offset = parseInteger(match, groupID[ID_LBA_OFFSET],
+                                     "LBAOffset") *
+                        lbaSize;
+    }
+    else {
+      linedata.offset =
+          parseInteger(match, groupID[ID_BYTE_OFFSET], "ByteOffset");
+    }
 
-  if (useLBALength) {
-    linedata.length = strtoul(match[groupID[ID_LBA_LENGTH]].str().c_str(),
-                              nullptr, useHex ? 16 : 10) *
-                      lbaSize;
+    if (useLBALength) {
+      linedata.length = parseInteger(match, groupID[ID_LBA_LENGTH],
+                                     "LBALength") *
+                        lbaSize;
+    }
+    else {
+      linedata.length =
+          parseInteger(match, groupID[ID_BYTE_LENGTH], "ByteLength");
+    }
   }
-  else {
-    linedata.length = strtoul(match[groupID[ID_BYTE_LENGTH]].str().c_str(),
-                              nullptr, useHex ? 16 : 10);
-  }
-
-  // This function increases I/O count
-  linedata.type = getType(match[groupID[ID_OPERATION]].str());
 }
 
 void TraceReplayer::submitIO() {
@@ -349,12 +465,69 @@ void TraceReplayer::submitIO() {
   bio.offset = linedata.offset;
   bio.length = linedata.length;
 
+  if (linedata.csdMatrixPreload) {
+    MatrixInfo info;
+
+    info.matrixSLBA = linedata.matrixSLBA;
+    info.rows = linedata.rows;
+    info.cols = linedata.cols;
+    info.matrixBytes = linedata.matrixBytes;
+    info.transferBytes = linedata.matrixTransferBytes;
+    info.transferLBAs = linedata.matrixTransferLBAs;
+    info.seed = linedata.matrixSeed;
+    info.payload = CSDWorkload::makeMatrixPayload(
+        linedata.rows, linedata.cols, linedata.matrixTransferBytes,
+        linedata.matrixSeed);
+
+    bio.payload = info.payload;
+    pendingMatrixPreloads[bio.id] = info;
+  }
+  else if (bio.type == BIL::BIO_READ_COMPUTE) {
+    bio.csd = std::make_shared<BIL::CSDGEMVRequest>();
+    bio.csd->matrixSLBA = linedata.matrixSLBA;
+    bio.csd->rows = linedata.rows;
+    bio.csd->cols = linedata.cols;
+    bio.csd->lda = linedata.cols;
+    bio.csd->vectorFP16 =
+        CSDWorkload::makeVector(linedata.cols, linedata.vectorSeed);
+    bio.csd->opcode = csdOpcode;
+    bio.csd->useSGL = csdUseSGL;
+
+    if (csdVerifyOutput) {
+      auto matrix = matrices.find(linedata.matrixSLBA);
+
+      if (matrix == matrices.end()) {
+        SimpleSSD::panic(
+            "CSD trace verification requires a prior matching M preload");
+      }
+      if (matrix->second.rows != linedata.rows ||
+          matrix->second.cols != linedata.cols) {
+        SimpleSSD::panic(
+            "CSD trace read_compute dimensions do not match matrix preload");
+      }
+
+      bio.csd->expectedFP32 = CSDWorkload::referenceGEMV(
+          *matrix->second.payload, linedata.rows, linedata.cols,
+          bio.csd->vectorFP16);
+      bio.csd->verifyOutput = true;
+    }
+
+    pendingCSD[bio.id] = bio.csd;
+  }
+
+  io_submitted += bio.length;
   bioEntry.submitIO(bio);
 
   io_depth++;
 
   if ((max_io != 0 && io_count >= max_io)) {
     reserveTermination = true;
+
+    return;
+  }
+
+  if (linedata.csdMatrixPreload) {
+    nextIOIsSync = true;
 
     return;
   }
@@ -377,8 +550,65 @@ void TraceReplayer::submitIO() {
   }
 }
 
-void TraceReplayer::iocallback(uint64_t) {
+void TraceReplayer::iocallback(uint64_t id, uint16_t status) {
   io_depth--;
+
+  bool completedMatrixPreload = false;
+  auto matrixPreload = pendingMatrixPreloads.find(id);
+  auto pendingCompute = pendingCSD.find(id);
+
+  if (status != 0) {
+    if (matrixPreload != pendingMatrixPreloads.end()) {
+      pendingMatrixPreloads.erase(matrixPreload);
+      SimpleSSD::panic("ordinary write failed with NVMe status 0x%04X",
+                       status);
+    }
+    if (pendingCompute != pendingCSD.end()) {
+      failed_compute_count++;
+      pendingCSD.erase(pendingCompute);
+      SimpleSSD::panic("read_compute failed with NVMe status 0x%04X", status);
+    }
+
+    SimpleSSD::panic("ordinary I/O failed with NVMe status 0x%04X", status);
+  }
+
+  if (matrixPreload != pendingMatrixPreloads.end()) {
+    matrices[matrixPreload->second.matrixSLBA] = matrixPreload->second;
+    pendingMatrixPreloads.erase(matrixPreload);
+    completedMatrixPreload = true;
+  }
+
+  if (pendingCompute != pendingCSD.end()) {
+    std::string message;
+
+    if (pendingCompute->second->verifyOutput &&
+        !CSDWorkload::outputMatches(pendingCompute->second->outputFP32,
+                                    pendingCompute->second->expectedFP32,
+                                    &message)) {
+      failed_compute_count++;
+      pendingCSD.erase(pendingCompute);
+      SimpleSSD::panic("read_compute GEMV verification failed: %s",
+                       message.c_str());
+    }
+
+    if (pendingCompute->second->verifyOutput) {
+      verified_compute_count++;
+    }
+    pendingCSD.erase(pendingCompute);
+  }
+
+  if (completedMatrixPreload && !reserveTermination) {
+    parseLine();
+
+    if (reserveTermination) {
+      return;
+    }
+    if (mode == MODE_STRICT) {
+      engine.scheduleEvent(submitEvent, linedata.tick - firstTick + initTime);
+
+      return;
+    }
+  }
 
   if (reserveTermination) {
     // Everything is done

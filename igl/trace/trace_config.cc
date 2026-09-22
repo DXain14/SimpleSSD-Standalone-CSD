@@ -40,6 +40,14 @@ const char NAME_GROUP_NANO_SEC[] = "Nanosecond";
 const char NAME_GROUP_PICO_SEC[] = "Picosecond";
 const char NAME_LBA_SIZE[] = "LBASize";
 const char NAME_USE_HEX[] = "UseHexadecimal";
+const char NAME_GROUP_MATRIX_SLBA[] = "MatrixSLBA";
+const char NAME_GROUP_ROWS[] = "Rows";
+const char NAME_GROUP_COLS[] = "Cols";
+const char NAME_GROUP_VECTOR_SEED[] = "VectorSeed";
+const char NAME_GROUP_MATRIX_SEED[] = "MatrixSeed";
+const char NAME_CSD_OPCODE[] = "CSDOpcode";
+const char NAME_CSD_USE_SGL[] = "CSDUseSGL";
+const char NAME_CSD_VERIFY_OUTPUT[] = "CSDVerifyOutput";
 
 TraceConfig::TraceConfig() {
   mode = MODE_SYNC;
@@ -55,8 +63,16 @@ TraceConfig::TraceConfig() {
   groupMicroSecond = 0;
   groupNanoSecond = 0;
   groupPicoSecond = 0;
+  groupMatrixSLBA = 0;
+  groupRows = 0;
+  groupCols = 0;
+  groupVectorSeed = 0;
+  groupMatrixSeed = 0;
   lbaSize = 512;
   useHexadecimal = false;
+  csdOpcode = 0xC0;
+  csdUseSGL = false;
+  csdVerifyOutput = false;
 }
 
 bool TraceConfig::setConfig(const char *name, const char *value) {
@@ -113,6 +129,30 @@ bool TraceConfig::setConfig(const char *name, const char *value) {
   else if (MATCH_NAME(NAME_USE_HEX)) {
     useHexadecimal = convertBool(value);
   }
+  else if (MATCH_NAME(NAME_GROUP_MATRIX_SLBA)) {
+    groupMatrixSLBA = strtoul(value, nullptr, 10);
+  }
+  else if (MATCH_NAME(NAME_GROUP_ROWS)) {
+    groupRows = strtoul(value, nullptr, 10);
+  }
+  else if (MATCH_NAME(NAME_GROUP_COLS)) {
+    groupCols = strtoul(value, nullptr, 10);
+  }
+  else if (MATCH_NAME(NAME_GROUP_VECTOR_SEED)) {
+    groupVectorSeed = strtoul(value, nullptr, 10);
+  }
+  else if (MATCH_NAME(NAME_GROUP_MATRIX_SEED)) {
+    groupMatrixSeed = strtoul(value, nullptr, 10);
+  }
+  else if (MATCH_NAME(NAME_CSD_OPCODE)) {
+    csdOpcode = strtoul(value, nullptr, 0);
+  }
+  else if (MATCH_NAME(NAME_CSD_USE_SGL)) {
+    csdUseSGL = convertBool(value);
+  }
+  else if (MATCH_NAME(NAME_CSD_VERIFY_OUTPUT)) {
+    csdVerifyOutput = convertBool(value);
+  }
   else {
     ret = false;
   }
@@ -151,6 +191,9 @@ void TraceConfig::update() {
 
   if (mode >= MODE_NUM) {
     SimpleSSD::panic("Invalid timing mode specified");
+  }
+  if (csdOpcode > 0xFF) {
+    SimpleSSD::panic("Invalid CSD opcode specified");
   }
 }
 
@@ -200,6 +243,24 @@ uint64_t TraceConfig::readUint(uint32_t idx) {
     case TRACE_LBA_SIZE:
       ret = lbaSize;
       break;
+    case TRACE_GROUP_MATRIX_SLBA:
+      ret = groupMatrixSLBA;
+      break;
+    case TRACE_GROUP_ROWS:
+      ret = groupRows;
+      break;
+    case TRACE_GROUP_COLS:
+      ret = groupCols;
+      break;
+    case TRACE_GROUP_VECTOR_SEED:
+      ret = groupVectorSeed;
+      break;
+    case TRACE_GROUP_MATRIX_SEED:
+      ret = groupMatrixSeed;
+      break;
+    case TRACE_CSD_OPCODE:
+      ret = csdOpcode;
+      break;
   }
 
   return ret;
@@ -226,6 +287,12 @@ bool TraceConfig::readBoolean(uint32_t idx) {
   switch (idx) {
     case TRACE_USE_HEX:
       ret = useHexadecimal;
+      break;
+    case TRACE_CSD_USE_SGL:
+      ret = csdUseSGL;
+      break;
+    case TRACE_CSD_VERIFY_OUTPUT:
+      ret = csdVerifyOutput;
       break;
   }
 

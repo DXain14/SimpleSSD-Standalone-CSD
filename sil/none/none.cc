@@ -55,8 +55,12 @@ void Driver::getInfo(uint64_t &bytesize, uint32_t &minbs) {
 }
 
 void Driver::submitIO(BIL::BIO &bio) {
+  if (bio.type == BIL::BIO_READ_COMPUTE) {
+    SimpleSSD::panic("CSD read_compute requires NVMe interface");
+  }
+
   SimpleSSD::HIL::Request req;
-  auto *pFunc = new std::function<void(uint64_t)>(bio.callback);
+  auto *pFunc = new std::function<void(uint64_t, uint16_t)>(bio.callback);
 
   // Convert to request
   req.reqID = bio.id;
@@ -66,7 +70,7 @@ void Driver::submitIO(BIL::BIO &bio) {
   req.length = bio.length;
   req.context = (void *)bio.id;
   req.function = [pFunc](uint64_t, void *context) {
-    pFunc->operator()((uint64_t)context);
+    pFunc->operator()((uint64_t)context, 0);
     delete pFunc;
   };
 

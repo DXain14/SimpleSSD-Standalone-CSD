@@ -37,11 +37,14 @@ BlockIOEntry::BlockIOEntry(ConfigReader &c, Engine &e, DriverInterface *i,
       lastProgress(0),
       io_progress(0),
       io_count(0),
+      error_count(0),
       minLatency(std::numeric_limits<uint64_t>::max()),
       maxLatency(0),
       sumLatency(0),
       squareSumLatency(0),
-      callback([this](uint64_t id) { completion(id); }) {
+      callback([this](uint64_t id, uint16_t status) {
+        completion(id, status);
+      }) {
   switch (c.readUint(CONFIG_GLOBAL, GLOBAL_SCHEDULER)) {
     case SCHEDULER_NOOP:
       pScheduler = new NoopScheduler(e, i);
@@ -72,7 +75,7 @@ void BlockIOEntry::submitIO(BIO &bio) {
   pScheduler->submitIO(copy);
 }
 
-void BlockIOEntry::completion(uint64_t id) {
+void BlockIOEntry::completion(uint64_t id, uint16_t status) {
   uint64_t tick = engine.getCurrentTick();
 
   for (auto iter = ioQueue.begin(); iter != ioQueue.end(); iter++) {
@@ -87,16 +90,21 @@ void BlockIOEntry::completion(uint64_t id) {
         progress.latency += tick;
         progress.iops++;
         progress.bandwidth += iter->length;
+
+        if (status != 0) {
+          error_count++;
+        }
       }
 
       if (pLatencyFile) {
         *pLatencyFile << std::to_string(iter->id) << ", "
                       << std::to_string(iter->offset) << ", "
                       << std::to_string(iter->length) << ", "
-                      << std::to_string(tick) << std::endl;
+                      << std::to_string(tick) << ", " << std::to_string(status)
+                      << std::endl;
       }
 
-      iter->callback(id);
+      iter->callback(id, status);
 
       ioQueue.erase(iter);
 
@@ -121,6 +129,7 @@ void BlockIOEntry::printStats(std::ostream &out) {
   double digit = log10(avgLatency);
 
   out << "*** Statistics of Block I/O Entry ***" << std::endl;
+  out << "I/O errors: " << error_count << std::endl;
 
   if (digit < 6.0) {
     out << "Latency (ps): min=" << std::to_string(minLatency)

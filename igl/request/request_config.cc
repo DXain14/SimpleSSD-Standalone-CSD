@@ -37,6 +37,15 @@ const char NAME_THINKTIME[] = "thinktime";
 const char NAME_RANDOM_SEED[] = "randseed";
 const char NAME_TIME_BASED[] = "time_based";
 const char NAME_RUN_TIME[] = "runtime";
+const char NAME_CSD_MATRIX_SLBA[] = "csd_matrix_slba";
+const char NAME_CSD_ROWS[] = "csd_rows";
+const char NAME_CSD_COLS[] = "csd_cols";
+const char NAME_CSD_MATRIX_COUNT[] = "csd_matrix_count";
+const char NAME_CSD_VECTOR_SEED[] = "csd_vector_seed";
+const char NAME_CSD_OPCODE[] = "csd_opcode";
+const char NAME_CSD_USE_SGL[] = "csd_use_sgl";
+const char NAME_CSD_PREWRITE_MATRIX[] = "csd_prewrite_matrix";
+const char NAME_CSD_VERIFY_OUTPUT[] = "csd_verify_output";
 
 RequestConfig::RequestConfig() {
   io_size = 0;
@@ -52,6 +61,15 @@ RequestConfig::RequestConfig() {
   randseed = 0;
   time_based = false;
   runtime = 0;
+  csdMatrixSLBA = 0;
+  csdRows = 16;
+  csdCols = 16;
+  csdMatrixCount = 1;
+  csdVectorSeed = 1;
+  csdOpcode = 0xC0;
+  csdUseSGL = false;
+  csdPrewriteMatrix = true;
+  csdVerifyOutput = false;
 }
 
 bool RequestConfig::setConfig(const char *name, const char *value) {
@@ -78,6 +96,12 @@ bool RequestConfig::setConfig(const char *name, const char *value) {
     }
     else if (strcasecmp(value, "randrw") == 0) {
       type = IO_RANDRW;
+    }
+    else if (strcasecmp(value, "readcompute") == 0) {
+      type = IO_READCOMPUTE;
+    }
+    else if (strcasecmp(value, "randreadcompute") == 0) {
+      type = IO_RANDREADCOMPUTE;
     }
     else {
       type = IO_TYPE_NUM;
@@ -124,6 +148,33 @@ bool RequestConfig::setConfig(const char *name, const char *value) {
   else if (MATCH_NAME(NAME_RUN_TIME)) {
     runtime = convertTime(value);
   }
+  else if (MATCH_NAME(NAME_CSD_MATRIX_SLBA)) {
+    csdMatrixSLBA = convertInteger(value);
+  }
+  else if (MATCH_NAME(NAME_CSD_ROWS)) {
+    csdRows = convertInteger(value);
+  }
+  else if (MATCH_NAME(NAME_CSD_COLS)) {
+    csdCols = convertInteger(value);
+  }
+  else if (MATCH_NAME(NAME_CSD_MATRIX_COUNT)) {
+    csdMatrixCount = convertInteger(value);
+  }
+  else if (MATCH_NAME(NAME_CSD_VECTOR_SEED)) {
+    csdVectorSeed = convertInteger(value);
+  }
+  else if (MATCH_NAME(NAME_CSD_OPCODE)) {
+    csdOpcode = strtoul(value, nullptr, 0);
+  }
+  else if (MATCH_NAME(NAME_CSD_USE_SGL)) {
+    csdUseSGL = convertBoolean(value);
+  }
+  else if (MATCH_NAME(NAME_CSD_PREWRITE_MATRIX)) {
+    csdPrewriteMatrix = convertBoolean(value);
+  }
+  else if (MATCH_NAME(NAME_CSD_VERIFY_OUTPUT)) {
+    csdVerifyOutput = convertBoolean(value);
+  }
   else {
     ret = false;
   }
@@ -140,6 +191,11 @@ void RequestConfig::update() {
   }
   if (rwmixread < 0 || rwmixread > 1) {
     SimpleSSD::panic("Invalid value of rwmixread");
+  }
+  if ((type == IO_READCOMPUTE || type == IO_RANDREADCOMPUTE) &&
+      (csdRows == 0 || csdCols == 0 || csdMatrixCount == 0 ||
+       csdOpcode > 0xFF)) {
+    SimpleSSD::panic("Invalid CSD read_compute generator configuration");
   }
 }
 
@@ -180,6 +236,24 @@ uint64_t RequestConfig::readUint(uint32_t idx) {
     case REQUEST_RUN_TIME:
       ret = runtime;
       break;
+    case REQUEST_CSD_MATRIX_SLBA:
+      ret = csdMatrixSLBA;
+      break;
+    case REQUEST_CSD_ROWS:
+      ret = csdRows;
+      break;
+    case REQUEST_CSD_COLS:
+      ret = csdCols;
+      break;
+    case REQUEST_CSD_MATRIX_COUNT:
+      ret = csdMatrixCount;
+      break;
+    case REQUEST_CSD_VECTOR_SEED:
+      ret = csdVectorSeed;
+      break;
+    case REQUEST_CSD_OPCODE:
+      ret = csdOpcode;
+      break;
   }
 
   return ret;
@@ -203,6 +277,15 @@ bool RequestConfig::readBoolean(uint32_t idx) {
   switch (idx) {
     case REQUEST_TIME_BASED:
       ret = time_based;
+      break;
+    case REQUEST_CSD_USE_SGL:
+      ret = csdUseSGL;
+      break;
+    case REQUEST_CSD_PREWRITE_MATRIX:
+      ret = csdPrewriteMatrix;
+      break;
+    case REQUEST_CSD_VERIFY_OUTPUT:
+      ret = csdVerifyOutput;
       break;
   }
 

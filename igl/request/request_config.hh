@@ -40,6 +40,15 @@ typedef enum {
   REQUEST_RANDOM_SEED,
   REQUEST_TIME_BASED,
   REQUEST_RUN_TIME,
+  REQUEST_CSD_MATRIX_SLBA,
+  REQUEST_CSD_ROWS,
+  REQUEST_CSD_COLS,
+  REQUEST_CSD_MATRIX_COUNT,
+  REQUEST_CSD_VECTOR_SEED,
+  REQUEST_CSD_OPCODE,
+  REQUEST_CSD_USE_SGL,
+  REQUEST_CSD_PREWRITE_MATRIX,
+  REQUEST_CSD_VERIFY_OUTPUT,
 } REQUEST_CONFIG;
 
 typedef enum {
@@ -49,6 +58,8 @@ typedef enum {
   IO_RANDWRITE,
   IO_READWRITE,
   IO_RANDRW,
+  IO_READCOMPUTE,
+  IO_RANDREADCOMPUTE,
   IO_TYPE_NUM,
 } IO_TYPE;
 
@@ -73,6 +84,15 @@ class RequestConfig : public SimpleSSD::BaseConfig {
   uint64_t randseed;
   bool time_based;
   uint64_t runtime;
+  uint64_t csdMatrixSLBA;
+  uint64_t csdRows;
+  uint64_t csdCols;
+  uint64_t csdMatrixCount;
+  uint64_t csdVectorSeed;
+  uint64_t csdOpcode;
+  bool csdUseSGL;
+  bool csdPrewriteMatrix;
+  bool csdVerifyOutput;
 
  public:
   RequestConfig();

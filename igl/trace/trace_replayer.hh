@@ -24,9 +24,12 @@
 
 #include <fstream>
 #include <list>
+#include <memory>
 #include <mutex>
 #include <regex>
 #include <thread>
+#include <unordered_map>
+#include <vector>
 
 #include "bil/entry.hh"
 #include "igl/io_gen.hh"
@@ -48,6 +51,11 @@ class TraceReplayer : public IOGenerator {
     ID_TIME_US,
     ID_TIME_NS,
     ID_TIME_PS,
+    ID_MATRIX_SLBA,
+    ID_ROWS,
+    ID_COLS,
+    ID_VECTOR_SEED,
+    ID_MATRIX_SEED,
     ID_NUM
   };
 
@@ -69,6 +77,9 @@ class TraceReplayer : public IOGenerator {
   uint32_t groupID[ID_NUM];
   bool timeValids[5];
   bool useHex;
+  uint8_t csdOpcode;
+  bool csdUseSGL;
+  bool csdVerifyOutput;
 
   uint64_t ssdSize;
   uint32_t blocksize;
@@ -84,28 +95,79 @@ class TraceReplayer : public IOGenerator {
   uint64_t io_count;      // I/O count created and submitted
   uint64_t read_count;
   uint64_t write_count;
+  uint64_t compute_count;
+  uint64_t verified_compute_count;
+  uint64_t failed_compute_count;
 
   uint64_t io_depth;
 
   uint64_t mergeTime(std::smatch &);
+  uint64_t parseInteger(std::smatch &, uint32_t, const char *);
   BIL::BIO_TYPE getType(std::string);
   void parseLine();
   void rescheduleSubmit(uint64_t);
+
+  struct MatrixInfo {
+    uint64_t matrixSLBA;
+    uint32_t rows;
+    uint32_t cols;
+    uint64_t matrixBytes;
+    uint64_t transferBytes;
+    uint64_t transferLBAs;
+    uint64_t seed;
+    std::shared_ptr<std::vector<uint8_t>> payload;
+
+    MatrixInfo()
+        : matrixSLBA(0),
+          rows(0),
+          cols(0),
+          matrixBytes(0),
+          transferBytes(0),
+          transferLBAs(0),
+          seed(0) {}
+  };
+
+  std::unordered_map<uint64_t, MatrixInfo> matrices;
+  std::unordered_map<uint64_t, MatrixInfo> pendingMatrixPreloads;
+  std::unordered_map<uint64_t, std::shared_ptr<BIL::CSDGEMVRequest>>
+      pendingCSD;
 
   struct TraceLine {
     uint64_t tick;
     uint64_t offset;
     uint64_t length;
     BIL::BIO_TYPE type;
+    bool csdMatrixPreload;
+    uint64_t matrixSLBA;
+    uint32_t rows;
+    uint32_t cols;
+    uint64_t vectorSeed;
+    uint64_t matrixSeed;
+    uint64_t matrixBytes;
+    uint64_t matrixTransferBytes;
+    uint64_t matrixTransferLBAs;
 
-    TraceLine() : tick(0), offset(0), length(0), type(BIL::BIO_NUM) {}
+    TraceLine()
+        : tick(0),
+          offset(0),
+          length(0),
+          type(BIL::BIO_NUM),
+          csdMatrixPreload(false),
+          matrixSLBA(0),
+          rows(0),
+          cols(0),
+          vectorSeed(0),
+          matrixSeed(0),
+          matrixBytes(0),
+          matrixTransferBytes(0),
+          matrixTransferLBAs(0) {}
   } linedata;
 
   SimpleSSD::Event submitEvent;
-  SimpleSSD::EventFunction completionEvent;
+  std::function<void(uint64_t, uint16_t)> completionEvent;
 
   void submitIO();
-  void iocallback(uint64_t);
+  void iocallback(uint64_t, uint16_t);
 
  public:
   TraceReplayer(Engine &, BIL::BlockIOEntry &, std::function<void()> &,

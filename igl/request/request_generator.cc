@@ -21,6 +21,7 @@
 
 #include <iostream>
 
+#include "igl/csd_workload.hh"
 #include "simplessd/sim/trace.hh"
 #include "simplessd/util/algorithm.hh"
 
@@ -32,8 +33,22 @@ RequestGenerator::RequestGenerator(Engine &e, BIL::BlockIOEntry &b,
       io_submitted(0),
       io_count(0),
       read_count(0),
+      compute_count(0),
+      setup_write_count(0),
+      verified_compute_count(0),
+      failed_compute_count(0),
       io_depth(0),
-      reserveTermination(false) {
+      reserveTermination(false),
+      csdMode(false),
+      csdPrewriteMatrix(false),
+      csdSetupDone(false),
+      csdLBABytes(0),
+      csdMatrixBytes(0),
+      csdMatrixTransferBytes(0),
+      csdMatrixTransferLBAs(0),
+      csdSetupSubmitted(0),
+      csdSetupCompleted(0),
+      csdMatrixElements(0) {
   // Read config
   io_size = c.readUint(CONFIG_REQ_GEN, REQUEST_IO_SIZE);
   type = (IO_TYPE)c.readUint(CONFIG_REQ_GEN, REQUEST_IO_TYPE);
@@ -48,6 +63,24 @@ RequestGenerator::RequestGenerator(Engine &e, BIL::BlockIOEntry &b,
   randseed = c.readUint(CONFIG_REQ_GEN, REQUEST_RANDOM_SEED);
   time_based = c.readBoolean(CONFIG_REQ_GEN, REQUEST_TIME_BASED);
   runtime = c.readUint(CONFIG_REQ_GEN, REQUEST_RUN_TIME);
+  csdMatrixSLBA = c.readUint(CONFIG_REQ_GEN, REQUEST_CSD_MATRIX_SLBA);
+  csdRows = c.readUint(CONFIG_REQ_GEN, REQUEST_CSD_ROWS);
+  csdCols = c.readUint(CONFIG_REQ_GEN, REQUEST_CSD_COLS);
+  csdMatrixCount = c.readUint(CONFIG_REQ_GEN, REQUEST_CSD_MATRIX_COUNT);
+  csdVectorSeed = c.readUint(CONFIG_REQ_GEN, REQUEST_CSD_VECTOR_SEED);
+  csdOpcode = (uint8_t)c.readUint(CONFIG_REQ_GEN, REQUEST_CSD_OPCODE);
+  csdUseSGL = c.readBoolean(CONFIG_REQ_GEN, REQUEST_CSD_USE_SGL);
+  csdPrewriteMatrix =
+      c.readBoolean(CONFIG_REQ_GEN, REQUEST_CSD_PREWRITE_MATRIX);
+  csdVerifyOutput =
+      c.readBoolean(CONFIG_REQ_GEN, REQUEST_CSD_VERIFY_OUTPUT);
+
+  csdMode = type == IO_READCOMPUTE || type == IO_RANDREADCOMPUTE;
+
+  if (csdMode &&
+      c.readUint(CONFIG_GLOBAL, GLOBAL_INTERFACE) != INTERFACE_NVME) {
+    SimpleSSD::panic("read_compute generator requires Interface = 1 (NVMe)");
+  }
 
   if (blockalign == 0) {
     blockalign = blocksize;
@@ -65,7 +98,9 @@ RequestGenerator::RequestGenerator(Engine &e, BIL::BlockIOEntry &b,
   randengine.seed(randseed);
 
   submitIO = [this](uint64_t tick) { _submitIO(tick); };
-  iocallback = [this](uint64_t id) { _iocallback(id); };
+  iocallback = [this](uint64_t id, uint16_t status) {
+    _iocallback(id, status);
+  };
 
   submitEvent = engine.allocateEvent(submitIO);
 }
@@ -108,12 +143,44 @@ void RequestGenerator::init(uint64_t bytesize, uint32_t bs) {
   }
 
   randgen = std::uniform_int_distribution<uint64_t>(offset, offset + size);
+
+  if (csdMode) {
+    CSDWorkload::Shape shape =
+        CSDWorkload::validateShape(csdRows, csdCols, "Request generator");
+
+    csdLBABytes = bs;
+    csdRows = shape.rows;
+    csdCols = shape.cols;
+    csdMatrixElements = shape.elements;
+    csdMatrixBytes = shape.matrixBytes;
+    csdMatrixTransferBytes = CSDWorkload::transferBytes(
+        csdMatrixBytes, (uint64_t)bs, "Request generator");
+    csdMatrixTransferLBAs = CSDWorkload::transferLBAs(
+        csdMatrixBytes, (uint64_t)bs, "Request generator");
+
+    CSDWorkload::validatePlacement(csdMatrixSLBA, csdMatrixTransferLBAs,
+                                   csdMatrixCount, bytesize / bs,
+                                   "Request generator");
+    CSDWorkload::validateControlBytes((uint32_t)csdRows, (uint32_t)csdCols, 0,
+                                      "Request generator");
+
+    csdMatrixRand =
+        std::uniform_int_distribution<uint64_t>(0, csdMatrixCount - 1);
+  }
 }
 
 void RequestGenerator::begin() {
   initTime = engine.getCurrentTick();
 
-  _submitIO(initTime);
+  if (csdMode && csdPrewriteMatrix) {
+    submitCSDSetup(initTime);
+  }
+  else if (csdMode) {
+    startCSDWorkload(initTime);
+  }
+  else {
+    _submitIO(initTime);
+  }
 }
 
 void RequestGenerator::printStats(std::ostream &out) {
@@ -128,7 +195,11 @@ void RequestGenerator::printStats(std::ostream &out) {
                         1000000000000.)
       << " B/s)" << std::endl;
   out << "I/O (counts): " << io_count << " (Read: " << read_count
-      << ", Write: " << io_count - read_count << ")" << std::endl;
+      << ", Write: " << io_count - read_count - compute_count
+      << ", ReadCompute: " << compute_count
+      << ", SetupWrite: " << setup_write_count << ")" << std::endl;
+  out << "VerifiedReadCompute: " << verified_compute_count << std::endl;
+  out << "FailedReadCompute: " << failed_compute_count << std::endl;
   out << "*** End of statistics ***" << std::endl;
 
   bioEntry.printStats(out);
@@ -191,6 +262,96 @@ void RequestGenerator::generateAddress(uint64_t &off, uint64_t &len) {
   }
 }
 
+std::shared_ptr<std::vector<uint8_t>> RequestGenerator::makeCSDMatrix(
+    uint64_t matrixIndex) {
+  uint64_t seed;
+
+  if (!CSDWorkload::checkedMul(matrixIndex, csdMatrixElements, seed)) {
+    SimpleSSD::panic("Request generator: CSD matrix seed overflow");
+  }
+
+  return CSDWorkload::makeMatrixPayload((uint32_t)csdRows, (uint32_t)csdCols,
+                                        csdMatrixTransferBytes, seed);
+}
+
+void RequestGenerator::fillReadComputeBIO(BIL::BIO &bio) {
+  uint64_t matrixIndex;
+
+  if (type == IO_RANDREADCOMPUTE) {
+    matrixIndex = csdMatrixRand(randengine);
+  }
+  else {
+    matrixIndex = compute_count % csdMatrixCount;
+  }
+
+  bio.type = BIL::BIO_READ_COMPUTE;
+  bio.offset = (csdMatrixSLBA + matrixIndex * csdMatrixTransferLBAs) *
+               csdLBABytes;
+  bio.length = csdMatrixBytes;
+  bio.csd = std::make_shared<BIL::CSDGEMVRequest>();
+  bio.csd->matrixSLBA = csdMatrixSLBA + matrixIndex * csdMatrixTransferLBAs;
+  bio.csd->rows = (uint32_t)csdRows;
+  bio.csd->cols = (uint32_t)csdCols;
+  bio.csd->lda = (uint32_t)csdCols;
+  bio.csd->vectorFP16 =
+      CSDWorkload::makeVector((uint32_t)csdCols, csdVectorSeed + compute_count);
+  bio.csd->opcode = csdOpcode;
+  bio.csd->useSGL = csdUseSGL;
+
+  if (csdVerifyOutput) {
+    auto matrix = makeCSDMatrix(matrixIndex);
+
+    bio.csd->expectedFP32 = CSDWorkload::referenceGEMV(
+        *matrix, (uint32_t)csdRows, (uint32_t)csdCols, bio.csd->vectorFP16);
+    bio.csd->verifyOutput = true;
+  }
+}
+
+void RequestGenerator::submitCSDSetup(uint64_t) {
+  if (csdSetupSubmitted >= csdMatrixCount) {
+    if (io_depth == 0) {
+      startCSDWorkload(engine.getCurrentTick());
+    }
+
+    return;
+  }
+
+  BIL::BIO bio;
+  uint64_t matrixIndex = csdSetupSubmitted++;
+
+  bio.id = io_count++;
+  bio.type = BIL::BIO_WRITE;
+  bio.offset = (csdMatrixSLBA + matrixIndex * csdMatrixTransferLBAs) *
+               csdLBABytes;
+  bio.length = csdMatrixTransferBytes;
+  bio.payload = makeCSDMatrix(matrixIndex);
+  bio.callback = [this](uint64_t, uint16_t status) {
+    io_depth--;
+    if (status != 0) {
+      SimpleSSD::panic("CSD matrix prewrite failed with NVMe status 0x%04X",
+                       status);
+    }
+    csdSetupCompleted++;
+
+    if (csdSetupCompleted == csdMatrixCount) {
+      startCSDWorkload(engine.getCurrentTick());
+    }
+    else {
+      submitCSDSetup(engine.getCurrentTick());
+    }
+  };
+
+  setup_write_count++;
+  io_depth++;
+  bioEntry.submitIO(bio);
+}
+
+void RequestGenerator::startCSDWorkload(uint64_t tick) {
+  csdSetupDone = true;
+  initTime = tick;
+  _submitIO(tick);
+}
+
 bool RequestGenerator::nextIOIsRead() {
   // This function determine next I/O is read or write
   // based on rwmixread
@@ -210,18 +371,31 @@ bool RequestGenerator::nextIOIsRead() {
 void RequestGenerator::_submitIO(uint64_t) {
   BIL::BIO bio;
 
-  // This function uses io_count (=0 at very beginning)
-  generateAddress(bio.offset, bio.length);
+  if (!csdMode) {
+    // This function uses io_count (=0 at very beginning)
+    generateAddress(bio.offset, bio.length);
+  }
 
   bio.id = io_count++;
 
-  // This function also uses io_count (=1 at very beginning)
-  if (nextIOIsRead()) {
-    bio.type = BIL::BIO_READ;
-    read_count++;
+  if (csdMode) {
+    if (!csdSetupDone) {
+      SimpleSSD::panic("CSD generator submitted compute before setup");
+    }
+
+    fillReadComputeBIO(bio);
+    pendingCSD[bio.id] = bio.csd;
+    compute_count++;
   }
   else {
-    bio.type = BIL::BIO_WRITE;
+    // This function also uses io_count (=1 at very beginning)
+    if (nextIOIsRead()) {
+      bio.type = BIL::BIO_READ;
+      read_count++;
+    }
+    else {
+      bio.type = BIL::BIO_WRITE;
+    }
   }
 
   io_submitted += bio.length;
@@ -238,8 +412,39 @@ void RequestGenerator::_submitIO(uint64_t) {
   rescheduleSubmit(submissionLatency);
 }
 
-void RequestGenerator::_iocallback(uint64_t) {
+void RequestGenerator::_iocallback(uint64_t id, uint16_t status) {
   io_depth--;
+
+  if (status != 0) {
+    auto pending = pendingCSD.find(id);
+
+    if (pending != pendingCSD.end()) {
+      failed_compute_count++;
+      pendingCSD.erase(pending);
+      SimpleSSD::panic("read_compute failed with NVMe status 0x%04X", status);
+    }
+
+    SimpleSSD::panic("ordinary I/O failed with NVMe status 0x%04X", status);
+  }
+
+  auto pending = pendingCSD.find(id);
+  if (pending != pendingCSD.end()) {
+    std::string message;
+
+    if (pending->second->verifyOutput &&
+        !CSDWorkload::outputMatches(pending->second->outputFP32,
+                                    pending->second->expectedFP32, &message)) {
+      failed_compute_count++;
+      pendingCSD.erase(pending);
+      SimpleSSD::panic("read_compute GEMV verification failed: %s",
+                       message.c_str());
+    }
+
+    if (pending->second->verifyOutput) {
+      verified_compute_count++;
+    }
+    pendingCSD.erase(pending);
+  }
 
   if (reserveTermination) {
     // No I/O will be generated anymore

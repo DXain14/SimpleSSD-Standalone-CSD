@@ -90,7 +90,6 @@ PRP::PRP(uint64_t size) : memory(nullptr), capacity(0), ptr1(0), ptr2(0) {
     ptr1 = (uint64_t)memory;
     ptr2 = (uint64_t)(memory + PAGE_SIZE);
     ptrList.push_back(ptr1);
-    ptrList.push_back(ptr2);
 
     if (mode == 3) {
       uint64_t *listPtr = (uint64_t *)ptr2;
@@ -116,6 +115,9 @@ PRP::PRP(uint64_t size) : memory(nullptr), capacity(0), ptr1(0), ptr2(0) {
         }
       }
     }
+    else {
+      ptrList.push_back(ptr2);
+    }
   }
 }
 
@@ -138,10 +140,11 @@ void PRP::readData(uint64_t offset, uint64_t size, uint8_t *buffer) {
   uint64_t copied = 0;
 
   for (uint64_t i = begin; i < end; i++) {
-    uint64_t ptr = ptrList[i] + (offset - i * PAGE_SIZE);
-    uint64_t len = MIN((i + 1) * PAGE_SIZE - offset, size - copied);
+    uint64_t pageOffset = i == begin ? offset % PAGE_SIZE : 0;
+    uint64_t ptr = ptrList[i] + pageOffset;
+    uint64_t len = MIN(PAGE_SIZE - pageOffset, size - copied);
 
-    memcpy(buffer, (uint8_t *)ptr, len);
+    memcpy(buffer + copied, (uint8_t *)ptr, len);
 
     copied += len;
   }
@@ -153,10 +156,11 @@ void PRP::writeData(uint64_t offset, uint64_t size, uint8_t *buffer) {
   uint64_t copied = 0;
 
   for (uint64_t i = begin; i < end; i++) {
-    uint64_t ptr = ptrList[i] + (offset - i * PAGE_SIZE);
-    uint64_t len = MIN((i + 1) * PAGE_SIZE - offset, size - copied);
+    uint64_t pageOffset = i == begin ? offset % PAGE_SIZE : 0;
+    uint64_t ptr = ptrList[i] + pageOffset;
+    uint64_t len = MIN(PAGE_SIZE - pageOffset, size - copied);
 
-    memcpy((uint8_t *)ptr, buffer, len);
+    memcpy((uint8_t *)ptr, buffer + copied, len);
 
     copied += len;
   }

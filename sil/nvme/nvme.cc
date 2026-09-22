@@ -19,18 +19,223 @@
 
 #include "sil/nvme/nvme.hh"
 
+#include <cstring>
+#include <limits>
+#include <utility>
+
+#include "simplessd/csd/config.hh"
 #include "simplessd/hil/nvme/controller.hh"
 #include "simplessd/hil/nvme/def.hh"
+#include "simplessd/sim/cpu.hh"
 #include "simplessd/util/algorithm.hh"
 
 namespace SIL {
 
 namespace NVMe {
 
+namespace {
+
+const uint64_t CSD_DESCRIPTOR_BYTES = 56;
+const uint64_t CSD_VECTOR_OFFSET = CSD_DESCRIPTOR_BYTES;
+
+bool checkedAdd(uint64_t a, uint64_t b, uint64_t &out) {
+  if (a > std::numeric_limits<uint64_t>::max() - b) {
+    return false;
+  }
+
+  out = a + b;
+
+  return true;
+}
+
+bool checkedMul(uint64_t a, uint64_t b, uint64_t &out) {
+  if (a != 0 && b > std::numeric_limits<uint64_t>::max() / a) {
+    return false;
+  }
+
+  out = a * b;
+
+  return true;
+}
+
+uint64_t alignUp(uint64_t value, uint64_t align) {
+  uint64_t add;
+
+  if (align == 0 || !checkedAdd(value, align - 1, add)) {
+    SimpleSSD::panic("CSD read_compute BIO has invalid descriptor layout");
+  }
+
+  return add / align * align;
+}
+
+void store16(std::vector<uint8_t> &buffer, uint64_t offset, uint16_t value) {
+  buffer[offset + 0] = value & 0xFF;
+  buffer[offset + 1] = (value >> 8) & 0xFF;
+}
+
+void store32(std::vector<uint8_t> &buffer, uint64_t offset, uint32_t value) {
+  buffer[offset + 0] = value & 0xFF;
+  buffer[offset + 1] = (value >> 8) & 0xFF;
+  buffer[offset + 2] = (value >> 16) & 0xFF;
+  buffer[offset + 3] = (value >> 24) & 0xFF;
+}
+
+void store64(std::vector<uint8_t> &buffer, uint64_t offset, uint64_t value) {
+  store32(buffer, offset, value & 0xFFFFFFFF);
+  store32(buffer, offset + 4, value >> 32);
+}
+
+struct SGLBuffer {
+  std::vector<uint8_t> storage;
+
+  explicit SGLBuffer(uint64_t size) : storage(size, 0) {}
+
+  void getDescriptor(uint64_t &data1, uint64_t &data2) {
+    data1 = (uint64_t)storage.data();
+    data2 = (uint64_t)(uint32_t)storage.size();
+  }
+
+  void readData(uint64_t offset, uint64_t size, uint8_t *buffer) {
+    memcpy(buffer, storage.data() + offset, size);
+  }
+
+  void writeData(uint64_t offset, uint64_t size, uint8_t *buffer) {
+    memcpy(storage.data() + offset, buffer, size);
+  }
+};
+
+struct BufferCommandContext {
+  PRP *prp;
+  SGLBuffer *sgl;
+  std::vector<uint8_t> *buffer;
+  bool readBack;
+  std::function<void(uint16_t)> callback;
+
+  BufferCommandContext(PRP *p, std::vector<uint8_t> *b, bool r,
+                       std::function<void(uint16_t)> f)
+      : prp(p), sgl(nullptr), buffer(b), readBack(r), callback(f) {}
+
+  BufferCommandContext(SGLBuffer *s, std::vector<uint8_t> *b, bool r,
+                       std::function<void(uint16_t)> f)
+      : prp(nullptr), sgl(s), buffer(b), readBack(r), callback(f) {}
+
+  ~BufferCommandContext() {
+    delete prp;
+    delete sgl;
+  }
+
+  void getPointer(uint64_t &data1, uint64_t &data2) {
+    if (prp) {
+      prp->getPointer(data1, data2);
+    }
+    else {
+      sgl->getDescriptor(data1, data2);
+    }
+  }
+
+  void readData(uint64_t offset, uint64_t size, uint8_t *data) {
+    if (prp) {
+      prp->readData(offset, size, data);
+    }
+    else {
+      sgl->readData(offset, size, data);
+    }
+  }
+
+  void writeData(uint64_t offset, uint64_t size, uint8_t *data) {
+    if (prp) {
+      prp->writeData(offset, size, data);
+    }
+    else {
+      sgl->writeData(offset, size, data);
+    }
+  }
+};
+
+struct CallbackContext {
+  std::function<void(uint16_t)> callback;
+
+  explicit CallbackContext(std::function<void(uint16_t)> f) : callback(f) {}
+};
+
+struct CSDIOContext {
+  PRP *prp;
+  SGLBuffer *sgl;
+  std::shared_ptr<BIL::CSDGEMVRequest> request;
+  std::vector<uint8_t> control;
+  uint64_t outputOffset;
+  uint64_t outputBytes;
+  uint64_t id;
+  std::function<void(uint64_t, uint16_t)> callback;
+
+  CSDIOContext(PRP *p, std::shared_ptr<BIL::CSDGEMVRequest> r,
+               std::vector<uint8_t> &&c, uint64_t outOffset,
+               uint64_t outBytes, uint64_t bioID,
+               std::function<void(uint64_t, uint16_t)> f)
+      : prp(p),
+        sgl(nullptr),
+        request(r),
+        control(std::move(c)),
+        outputOffset(outOffset),
+        outputBytes(outBytes),
+        id(bioID),
+        callback(f) {}
+
+  CSDIOContext(SGLBuffer *s, std::shared_ptr<BIL::CSDGEMVRequest> r,
+               std::vector<uint8_t> &&c, uint64_t outOffset,
+               uint64_t outBytes, uint64_t bioID,
+               std::function<void(uint64_t, uint16_t)> f)
+      : prp(nullptr),
+        sgl(s),
+        request(r),
+        control(std::move(c)),
+        outputOffset(outOffset),
+        outputBytes(outBytes),
+        id(bioID),
+        callback(f) {}
+
+  ~CSDIOContext() {
+    delete prp;
+    delete sgl;
+  }
+
+  void getPointer(uint64_t &data1, uint64_t &data2) {
+    if (prp) {
+      prp->getPointer(data1, data2);
+    }
+    else {
+      sgl->getDescriptor(data1, data2);
+    }
+  }
+
+  void readData(uint64_t offset, uint64_t size, uint8_t *data) {
+    if (prp) {
+      prp->readData(offset, size, data);
+    }
+    else {
+      sgl->readData(offset, size, data);
+    }
+  }
+
+  void writeData(uint64_t offset, uint64_t size, uint8_t *data) {
+    if (prp) {
+      prp->writeData(offset, size, data);
+    }
+    else {
+      sgl->writeData(offset, size, data);
+    }
+  }
+};
+
+}  // namespace
+
 Driver::Driver(Engine &e, SimpleSSD::ConfigReader &conf)
     : BIL::DriverInterface(e),
       dmaReadPending(false),
       dmaWritePending(false),
+      csdMaxControlBytes(
+          conf.readUint(SimpleSSD::CONFIG_CSD,
+                        SimpleSSD::CSD::CSD_MAX_CONTROL_BYTES)),
       phase(true),
       adminSQ(nullptr),
       adminCQ(nullptr),
@@ -364,6 +569,7 @@ void Driver::submitIO(BIL::BIO &bio) {
 
   uint64_t slba = bio.offset / LBAsize;
   uint32_t nlb = (uint32_t)DIVCEIL(bio.length, LBAsize);
+  uint64_t transferBytes = (uint64_t)nlb * LBAsize;
 
   cmd[1] = namespaceID;  // NSID
 
@@ -373,7 +579,7 @@ void Driver::submitIO(BIL::BIO &bio) {
     cmd[11] = slba >> 32;
     cmd[12] = nlb - 1;  // LR, FUA, PRINFO, NLB
 
-    prp = new PRP(bio.length);
+    prp = new PRP(transferBytes);
     prp->getPointer(*(uint64_t *)(cmd + 6), *(uint64_t *)(cmd + 8));  // DPTR
   }
   else if (bio.type == BIL::BIO_WRITE) {
@@ -382,7 +588,16 @@ void Driver::submitIO(BIL::BIO &bio) {
     cmd[11] = slba >> 32;
     cmd[12] = nlb - 1;  // LR, FUA, PRINFO, DTYPE, NLB
 
-    prp = new PRP(bio.length);
+    prp = new PRP(transferBytes);
+
+    if (bio.payload) {
+      if (bio.payload->size() < bio.length) {
+        SimpleSSD::panic("NVMe BIO write payload is shorter than length");
+      }
+
+      prp->writeData(0, bio.length, bio.payload->data());
+    }
+
     prp->getPointer(*(uint64_t *)(cmd + 6), *(uint64_t *)(cmd + 8));  // DPTR
   }
   else if (bio.type == BIL::BIO_FLUSH) {
@@ -405,9 +620,358 @@ void Driver::submitIO(BIL::BIO &bio) {
 
     prp->writeData(0, 16, data);
   }
+  else if (bio.type == BIL::BIO_READ_COMPUTE) {
+    if (!bio.csd) {
+      SimpleSSD::panic("CSD read_compute BIO has no GEMV descriptor");
+    }
+    if (bio.csd->rows == 0 || bio.csd->cols == 0) {
+      SimpleSSD::panic("CSD read_compute BIO has invalid dimensions");
+    }
+    if (bio.csd->vectorFP16.size() != bio.csd->cols) {
+      SimpleSSD::panic("CSD read_compute BIO vector length mismatch");
+    }
+
+    uint32_t lda = bio.csd->lda == 0 ? bio.csd->cols : bio.csd->lda;
+    uint64_t vectorBytes;
+    uint64_t outputBytes;
+    uint64_t vectorEnd;
+    uint64_t outputOffset;
+    uint64_t minimumControlBytes;
+
+    if (!checkedMul(bio.csd->cols, sizeof(uint16_t), vectorBytes) ||
+        !checkedMul(bio.csd->rows, sizeof(float), outputBytes) ||
+        !checkedAdd(CSD_VECTOR_OFFSET, vectorBytes, vectorEnd)) {
+      SimpleSSD::panic("CSD read_compute BIO has invalid descriptor layout");
+    }
+
+    outputOffset = alignUp(vectorEnd, sizeof(float));
+
+    if (!checkedAdd(outputOffset, outputBytes, minimumControlBytes)) {
+      SimpleSSD::panic("CSD read_compute BIO has invalid descriptor layout");
+    }
+    uint64_t controlBytes = bio.csd->controlBytes == 0
+                                ? minimumControlBytes
+                                : bio.csd->controlBytes;
+
+    if (lda != bio.csd->cols || controlBytes < minimumControlBytes ||
+        controlBytes > csdMaxControlBytes ||
+        controlBytes > std::numeric_limits<uint32_t>::max()) {
+      SimpleSSD::panic("CSD read_compute BIO has invalid descriptor layout");
+    }
+
+    std::vector<uint8_t> control(controlBytes, 0);
+
+    control[0] = 'C';
+    control[1] = 'S';
+    control[2] = 'D';
+    control[3] = '0';
+    store16(control, 4, 1);
+    store16(control, 6, 1);
+    store32(control, 8, 0);
+    store64(control, 16, bio.csd->matrixSLBA);
+    store32(control, 24, bio.csd->rows);
+    store32(control, 28, bio.csd->cols);
+    store32(control, 32, lda);
+    store64(control, 40, CSD_VECTOR_OFFSET);
+    store64(control, 48, outputOffset);
+
+    for (uint32_t i = 0; i < bio.csd->cols; i++) {
+      store16(control, CSD_VECTOR_OFFSET + (uint64_t)i * sizeof(uint16_t),
+              bio.csd->vectorFP16[i]);
+    }
+
+    bio.csd->outputFP32.assign(bio.csd->rows, 0.f);
+
+    CSDIOContext *context;
+    ResponseHandler csdCallback = [](uint16_t status, uint32_t,
+                                     void *opaque) {
+      auto context = (CSDIOContext *)opaque;
+
+      if (status == 0) {
+        std::vector<uint8_t> raw(context->outputBytes, 0);
+
+        context->readData(context->outputOffset, context->outputBytes,
+                          raw.data());
+
+        for (uint32_t i = 0; i < context->request->rows; i++) {
+          memcpy(context->request->outputFP32.data() + i,
+                 raw.data() + (uint64_t)i * sizeof(float), sizeof(float));
+        }
+      }
+      else {
+        SimpleSSD::warn("CSD read_compute BIO error: %04X", status);
+      }
+
+      context->callback(context->id, status);
+
+      delete context;
+    };
+
+    if (bio.csd->useSGL) {
+      context = new CSDIOContext(new SGLBuffer(controlBytes), bio.csd,
+                                 std::move(control), outputOffset, outputBytes,
+                                 bio.id, bio.callback);
+    }
+    else {
+      context = new CSDIOContext(new PRP(controlBytes), bio.csd,
+                                 std::move(control), outputOffset, outputBytes,
+                                 bio.id, bio.callback);
+    }
+
+    context->writeData(0, controlBytes, context->control.data());
+    context->getPointer(*(uint64_t *)(cmd + 6), *(uint64_t *)(cmd + 8));
+
+    cmd[0] = bio.csd->opcode;
+    cmd[10] = (uint32_t)controlBytes;
+
+    if (bio.csd->useSGL) {
+      ((uint8_t *)cmd)[1] = 0x40;
+    }
+
+    submitCommand(1, (uint8_t *)cmd, csdCallback, context);
+
+    return;
+  }
+  else {
+    SimpleSSD::panic("Unsupported BIO type");
+  }
 
   submitCommand(1, (uint8_t *)cmd, callback,
                 new IOWrapper(bio.id, prp, bio.callback));
+}
+
+void Driver::submitWriteBuffer(uint64_t offset, const uint8_t *buffer,
+                               uint64_t length,
+                               std::function<void(uint16_t)> callback) {
+  uint32_t cmd[16];
+  uint64_t slba = offset / LBAsize;
+  uint32_t nlb = (uint32_t)DIVCEIL(length, LBAsize);
+  uint64_t transferBytes = (uint64_t)nlb * LBAsize;
+  PRP *prp = new PRP(transferBytes);
+  auto context = new BufferCommandContext(prp, nullptr, false, callback);
+  ResponseHandler done = [](uint16_t status, uint32_t, void *opaque) {
+    auto context = (BufferCommandContext *)opaque;
+
+    context->callback(status);
+
+    delete context;
+  };
+
+  memset(cmd, 0, 64);
+
+  if (length == 0 || offset % LBAsize != 0) {
+    SimpleSSD::panic("CSD smoke write should be LBA-aligned and non-empty");
+  }
+
+  prp->writeData(0, length, const_cast<uint8_t *>(buffer));
+  prp->getPointer(*(uint64_t *)(cmd + 6), *(uint64_t *)(cmd + 8));
+
+  cmd[0] = SimpleSSD::HIL::NVMe::OPCODE_WRITE;
+  cmd[1] = namespaceID;
+  cmd[10] = (uint32_t)slba;
+  cmd[11] = slba >> 32;
+  cmd[12] = nlb - 1;
+
+  submitCommand(1, (uint8_t *)cmd, done, context);
+}
+
+void Driver::submitReadBuffer(uint64_t offset, std::vector<uint8_t> &buffer,
+                              std::function<void(uint16_t)> callback) {
+  uint32_t cmd[16];
+  uint64_t slba = offset / LBAsize;
+  uint32_t nlb = (uint32_t)DIVCEIL(buffer.size(), LBAsize);
+  uint64_t transferBytes = (uint64_t)nlb * LBAsize;
+  PRP *prp = new PRP(transferBytes);
+  auto context = new BufferCommandContext(prp, &buffer, true, callback);
+  ResponseHandler done = [](uint16_t status, uint32_t, void *opaque) {
+    auto context = (BufferCommandContext *)opaque;
+
+    if (status == 0 && context->buffer) {
+      context->readData(0, context->buffer->size(), context->buffer->data());
+    }
+
+    context->callback(status);
+
+    delete context;
+  };
+
+  memset(cmd, 0, 64);
+
+  if (buffer.size() == 0 || offset % LBAsize != 0 ||
+      buffer.size() % LBAsize != 0) {
+    SimpleSSD::panic("NVMe read buffer should be LBA-aligned and non-empty");
+  }
+
+  context->getPointer(*(uint64_t *)(cmd + 6), *(uint64_t *)(cmd + 8));
+
+  cmd[0] = SimpleSSD::HIL::NVMe::OPCODE_READ;
+  cmd[1] = namespaceID;
+  cmd[10] = (uint32_t)slba;
+  cmd[11] = slba >> 32;
+  cmd[12] = nlb - 1;
+
+  submitCommand(1, (uint8_t *)cmd, done, context);
+}
+
+void Driver::submitCompareBuffer(uint64_t offset, const uint8_t *buffer,
+                                 uint64_t length,
+                                 std::function<void(uint16_t)> callback) {
+  uint32_t cmd[16];
+  uint64_t slba = offset / LBAsize;
+  uint32_t nlb = (uint32_t)DIVCEIL(length, LBAsize);
+  uint64_t transferBytes = (uint64_t)nlb * LBAsize;
+  PRP *prp = new PRP(transferBytes);
+  auto context = new BufferCommandContext(prp, nullptr, false, callback);
+  ResponseHandler done = [](uint16_t status, uint32_t, void *opaque) {
+    auto context = (BufferCommandContext *)opaque;
+
+    context->callback(status);
+
+    delete context;
+  };
+
+  memset(cmd, 0, 64);
+
+  if (length == 0 || offset % LBAsize != 0 || length % LBAsize != 0) {
+    SimpleSSD::panic("NVMe compare buffer should be LBA-aligned and non-empty");
+  }
+
+  context->writeData(0, length, const_cast<uint8_t *>(buffer));
+  context->getPointer(*(uint64_t *)(cmd + 6), *(uint64_t *)(cmd + 8));
+
+  cmd[0] = SimpleSSD::HIL::NVMe::OPCODE_COMPARE;
+  cmd[1] = namespaceID;
+  cmd[10] = (uint32_t)slba;
+  cmd[11] = slba >> 32;
+  cmd[12] = nlb - 1;
+
+  submitCommand(1, (uint8_t *)cmd, done, context);
+}
+
+void Driver::submitTrim(uint64_t offset, uint64_t length,
+                        std::function<void(uint16_t)> callback) {
+  uint32_t cmd[16];
+  uint64_t slba = offset / LBAsize;
+  uint32_t nlb = (uint32_t)DIVCEIL(length, LBAsize);
+  PRP *prp = new PRP(16);
+  auto context = new BufferCommandContext(prp, nullptr, false, callback);
+  ResponseHandler done = [](uint16_t status, uint32_t, void *opaque) {
+    auto context = (BufferCommandContext *)opaque;
+
+    context->callback(status);
+
+    delete context;
+  };
+  uint8_t range[16];
+
+  memset(cmd, 0, 64);
+  memset(range, 0, sizeof(range));
+
+  if (length == 0 || offset % LBAsize != 0 || length % LBAsize != 0) {
+    SimpleSSD::panic("NVMe trim range should be LBA-aligned and non-empty");
+  }
+
+  memcpy(range + 4, &nlb, sizeof(nlb));
+  memcpy(range + 8, &slba, sizeof(slba));
+  context->writeData(0, sizeof(range), range);
+  context->getPointer(*(uint64_t *)(cmd + 6), *(uint64_t *)(cmd + 8));
+
+  cmd[0] = SimpleSSD::HIL::NVMe::OPCODE_DATASET_MANAGEMEMT;
+  cmd[1] = namespaceID;
+  cmd[10] = 0;
+  cmd[11] = 0x04;
+
+  submitCommand(1, (uint8_t *)cmd, done, context);
+}
+
+void Driver::submitFormat(bool secureErase,
+                          std::function<void(uint16_t)> callback) {
+  uint32_t cmd[16];
+  auto context = new CallbackContext(callback);
+  ResponseHandler done = [](uint16_t status, uint32_t, void *opaque) {
+    auto context = (CallbackContext *)opaque;
+
+    context->callback(status);
+
+    delete context;
+  };
+
+  memset(cmd, 0, sizeof(cmd));
+
+  cmd[0] = SimpleSSD::HIL::NVMe::OPCODE_FORMAT_NVM;
+  cmd[1] = namespaceID;
+  cmd[10] = secureErase ? 0x0200 : 0x0000;
+
+  submitCommand(0, (uint8_t *)cmd, done, context);
+}
+
+void Driver::submitCSDReadCompute(std::vector<uint8_t> &control,
+                                  std::function<void(uint16_t)> callback) {
+  submitCSDReadCompute(control, SimpleSSD::HIL::NVMe::OPCODE_CSD_READ_COMPUTE,
+                       false, callback);
+}
+
+void Driver::submitCSDReadCompute(std::vector<uint8_t> &control,
+                                  uint8_t opcode, bool useSGL,
+                                  std::function<void(uint16_t)> callback) {
+  submitCSDReadComputeForNamespace(control, namespaceID, opcode, useSGL,
+                                   callback);
+}
+
+void Driver::submitCSDReadComputeForNamespace(
+    std::vector<uint8_t> &control, uint32_t nsid, uint8_t opcode, bool useSGL,
+    std::function<void(uint16_t)> callback) {
+  if (control.size() > std::numeric_limits<uint32_t>::max()) {
+    SimpleSSD::panic("CSD read_compute control buffer is too large");
+  }
+
+  submitCSDReadComputeForNamespaceWithCommandBytes(
+      control, nsid, (uint32_t)control.size(), opcode, useSGL, callback);
+}
+
+void Driver::submitCSDReadComputeForNamespaceWithCommandBytes(
+    std::vector<uint8_t> &control, uint32_t nsid, uint32_t commandControlBytes,
+    uint8_t opcode, bool useSGL, std::function<void(uint16_t)> callback) {
+  uint32_t cmd[16];
+  BufferCommandContext *context;
+  ResponseHandler done = [](uint16_t status, uint32_t, void *opaque) {
+    auto context = (BufferCommandContext *)opaque;
+
+    if (status == 0 && context->readBack && context->buffer) {
+      context->readData(0, context->buffer->size(), context->buffer->data());
+    }
+
+    context->callback(status);
+
+    delete context;
+  };
+
+  memset(cmd, 0, 64);
+
+  if (control.size() == 0) {
+    SimpleSSD::panic("CSD read_compute control buffer should be non-empty");
+  }
+
+  if (useSGL) {
+    context = new BufferCommandContext(new SGLBuffer(control.size()), &control,
+                                       true, callback);
+  }
+  else {
+    context = new BufferCommandContext(new PRP(control.size()), &control, true,
+                                       callback);
+  }
+
+  context->writeData(0, control.size(), control.data());
+  context->getPointer(*(uint64_t *)(cmd + 6), *(uint64_t *)(cmd + 8));
+
+  cmd[0] = opcode;
+  cmd[1] = nsid;
+  cmd[10] = commandControlBytes;
+  if (useSGL) {
+    ((uint8_t *)cmd)[1] = 0x40;
+  }
+
+  submitCommand(1, (uint8_t *)cmd, done, context);
 }
 
 void Driver::_io(uint16_t status, void *context) {
@@ -418,7 +982,7 @@ void Driver::_io(uint16_t status, void *context) {
     SimpleSSD::warn("I/O error: %04X", status);
   }
 
-  wrapper->bioCallback(wrapper->id);
+  wrapper->bioCallback(wrapper->id, status);
 
   delete prp;
   delete wrapper;
@@ -432,6 +996,11 @@ void Driver::initStats(std::vector<SimpleSSD::Stats> &list) {
 void Driver::getStats(std::vector<double> &values) {
   pController->getStatValues(values);
   SimpleSSD::getCPUStatValues(values);
+}
+
+void Driver::resetStats() {
+  pController->resetStatValues();
+  SimpleSSD::resetCPUStatValues();
 }
 
 void Driver::dmaRead(uint64_t addr, uint64_t size, uint8_t *buffer,

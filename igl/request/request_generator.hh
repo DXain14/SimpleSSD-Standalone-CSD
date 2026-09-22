@@ -26,6 +26,7 @@
 #include <mutex>
 #include <random>
 #include <thread>
+#include <unordered_map>
 
 #include "bil/entry.hh"
 #include "igl/io_gen.hh"
@@ -48,6 +49,10 @@ class RequestGenerator : public IOGenerator {
 
   uint64_t io_count;
   uint64_t read_count;
+  uint64_t compute_count;
+  uint64_t setup_write_count;
+  uint64_t verified_compute_count;
+  uint64_t failed_compute_count;
   float rwmixread;
 
   uint64_t offset;
@@ -61,6 +66,7 @@ class RequestGenerator : public IOGenerator {
   uint64_t randseed;
   std::mt19937_64 randengine;
   std::uniform_int_distribution<uint64_t> randgen;
+  std::uniform_int_distribution<uint64_t> csdMatrixRand;
 
   bool time_based;
   uint64_t runtime;
@@ -72,17 +78,41 @@ class RequestGenerator : public IOGenerator {
 
   uint64_t initTime;
   bool reserveTermination;
+  bool csdMode;
+  bool csdPrewriteMatrix;
+  bool csdSetupDone;
+  uint64_t csdMatrixSLBA;
+  uint64_t csdRows;
+  uint64_t csdCols;
+  uint64_t csdMatrixCount;
+  uint64_t csdVectorSeed;
+  uint8_t csdOpcode;
+  bool csdUseSGL;
+  bool csdVerifyOutput;
+  uint64_t csdLBABytes;
+  uint64_t csdMatrixBytes;
+  uint64_t csdMatrixTransferBytes;
+  uint64_t csdMatrixTransferLBAs;
+  uint64_t csdSetupSubmitted;
+  uint64_t csdSetupCompleted;
+  uint64_t csdMatrixElements;
+  std::unordered_map<uint64_t, std::shared_ptr<BIL::CSDGEMVRequest>>
+      pendingCSD;
 
   void generateAddress(uint64_t &, uint64_t &);
+  std::shared_ptr<std::vector<uint8_t>> makeCSDMatrix(uint64_t);
+  void fillReadComputeBIO(BIL::BIO &);
+  void submitCSDSetup(uint64_t);
+  void startCSDWorkload(uint64_t);
   bool nextIOIsRead();
   void rescheduleSubmit(uint64_t);
 
   SimpleSSD::Event submitEvent;
   SimpleSSD::EventFunction submitIO;
-  SimpleSSD::EventFunction iocallback;
+  std::function<void(uint64_t, uint16_t)> iocallback;
 
   void _submitIO(uint64_t);
-  void _iocallback(uint64_t);
+  void _iocallback(uint64_t, uint16_t);
 
  public:
   RequestGenerator(Engine &, BIL::BlockIOEntry &, std::function<void()> &,

@@ -24,6 +24,7 @@
 
 #include <list>
 #include <queue>
+#include <vector>
 
 #include "bil/interface.hh"
 #include "sil/nvme/prp.hh"
@@ -75,9 +76,9 @@ typedef struct _CommandEntry {
 typedef struct _IOWrapper {
   uint64_t id;
   PRP *prp;
-  std::function<void(uint64_t)> bioCallback;
+  std::function<void(uint64_t, uint16_t)> bioCallback;
 
-  _IOWrapper(uint64_t i, PRP *p, std::function<void(uint64_t)> &f)
+  _IOWrapper(uint64_t i, PRP *p, std::function<void(uint64_t, uint16_t)> &f)
       : id(i), prp(p), bioCallback(f) {}
 } IOWrapper;
 
@@ -99,6 +100,7 @@ class Driver : public BIL::DriverInterface, SimpleSSD::HIL::NVMe::Interface {
   uint64_t capacity;
   uint32_t LBAsize;
   uint32_t namespaceID;
+  uint64_t csdMaxControlBytes;
 
   // Queue
   uint16_t maxQueueEntries;
@@ -138,8 +140,28 @@ class Driver : public BIL::DriverInterface, SimpleSSD::HIL::NVMe::Interface {
   void getInfo(uint64_t &, uint32_t &) override;
   void submitIO(BIL::BIO &) override;
 
+  void submitWriteBuffer(uint64_t, const uint8_t *, uint64_t,
+                         std::function<void(uint16_t)>);
+  void submitReadBuffer(uint64_t, std::vector<uint8_t> &,
+                        std::function<void(uint16_t)>);
+  void submitCompareBuffer(uint64_t, const uint8_t *, uint64_t,
+                           std::function<void(uint16_t)>);
+  void submitTrim(uint64_t, uint64_t, std::function<void(uint16_t)>);
+  void submitFormat(bool, std::function<void(uint16_t)>);
+  void submitCSDReadCompute(std::vector<uint8_t> &,
+                            std::function<void(uint16_t)>);
+  void submitCSDReadCompute(std::vector<uint8_t> &, uint8_t, bool,
+                            std::function<void(uint16_t)>);
+  void submitCSDReadComputeForNamespace(std::vector<uint8_t> &, uint32_t,
+                                        uint8_t, bool,
+                                        std::function<void(uint16_t)>);
+  void submitCSDReadComputeForNamespaceWithCommandBytes(
+      std::vector<uint8_t> &, uint32_t, uint32_t, uint8_t, bool,
+      std::function<void(uint16_t)>);
+
   void initStats(std::vector<SimpleSSD::Stats> &) override;
   void getStats(std::vector<double> &) override;
+  void resetStats();
 
   // SimpleSSD::DMAInterface
   void dmaRead(uint64_t, uint64_t, uint8_t *, SimpleSSD::DMAFunction &,
