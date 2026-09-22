@@ -16,7 +16,7 @@ The `simplessd/` directory is a Git submodule. Its current local source tree
 is pinned to the public CSD-modified SimpleSSD fork:
 
 - Repository: `https://github.com/DXain14/SimpleSSD-CSD.git`
-- CSD commit: `1c886626d5abecdc87d69ba7388db4a26869e6b8`
+- CSD commit: `60d9fdb335fd6ba7643da9766f1edf19ea30e8c6`
 - Upstream base: `73ad8ad5220ce5ebfeb055687d0328765a046c0f`
 - License: GNU GPLv3
 

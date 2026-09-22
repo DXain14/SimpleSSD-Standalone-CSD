@@ -13,7 +13,7 @@ Published fork:
 
 - Repository: `https://github.com/DXain14/SimpleSSD-Standalone-CSD`
 - Embedded CSD SimpleSSD: `https://github.com/DXain14/SimpleSSD-CSD`
-- Embedded CSD commit: `1c886626d5abecdc87d69ba7388db4a26869e6b8`
+- Embedded CSD commit: `60d9fdb335fd6ba7643da9766f1edf19ea30e8c6`
 
 This repository is an unofficial fork and must not be presented as an
 official upstream release.

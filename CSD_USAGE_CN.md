@@ -24,7 +24,7 @@ standalone 的子模块已经指向公开可访问的 CSD SimpleSSD fork：
 
 ```text
 https://github.com/DXain14/SimpleSSD-CSD.git
-commit 1c886626d5abecdc87d69ba7388db4a26869e6b8
+commit 60d9fdb335fd6ba7643da9766f1edf19ea30e8c6
 ```
 
 ## 2. 当前功能范围
